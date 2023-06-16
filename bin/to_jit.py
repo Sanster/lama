@@ -17,12 +17,12 @@ class JITWrapper(nn.Module):
         self.model = model
 
     def forward(self, image, mask):
-        batch = {
-            "image": image,
-            "mask": mask
-        }
+        mask = torch.where(mask > 0.5, 1.0, mask)
+        batch = {"image": image, "mask": mask}
         out = self.model(batch)
-        return out["inpainted"]
+        out = out["inpainted"] * 255
+        out = torch.clamp(out, 0, 255)
+        return out
 
 
 @hydra.main(config_path="../configs/prediction", config_name="default.yaml")
@@ -45,8 +45,8 @@ def main(predict_config: OmegaConf):
     model.eval()
     jit_model_wrapper = JITWrapper(model)
 
-    image = torch.rand(1, 3, 120, 120)
-    mask = torch.rand(1, 1, 120, 120)
+    image = torch.rand(1, 3, 512, 512)
+    mask = torch.rand(1, 1, 512, 512)
     output = jit_model_wrapper(image, mask)
 
     if torch.cuda.is_available():
@@ -56,10 +56,82 @@ def main(predict_config: OmegaConf):
 
     image = image.to(device)
     mask = mask.to(device)
-    traced_model = torch.jit.trace(jit_model_wrapper, (image, mask), strict=False).to(device)
+    traced_model = torch.jit.trace(jit_model_wrapper, (image, mask), strict=False).to(
+        device
+    )
 
-    save_path = Path(predict_config.save_path)
-    save_path.parent.mkdir(parents=True, exist_ok=True)
+    import coremltools as ct
+
+    # Using image_input in the inputs parameter:
+    # Convert to Core ML program using the Unified Conversion API.
+    # 动态尺寸
+    # input_image_shape = ct.Shape(
+    #     shape=(
+    #         1,
+    #         3,
+    #         ct.RangeDim(lower_bound=512, upper_bound=1024, default=512),
+    #         ct.RangeDim(lower_bound=512, upper_bound=1024, default=512),
+    #     )
+    # )
+    # input_mask_shape = ct.Shape(
+    #     shape=(
+    #         1,
+    #         1,
+    #         ct.RangeDim(lower_bound=512, upper_bound=1024, default=512),
+    #         ct.RangeDim(lower_bound=512, upper_bound=1024, default=512),
+    #     )
+    # )
+
+    # 枚举尺寸
+    # input_image_shape = ct.EnumeratedShapes(
+    #     shapes=[
+    #         [1, 3, 512, 512],
+    #         [1, 3, 1024, 1024],
+    #     ],
+    #     default=(1, 3, 512, 512),
+    # )
+    # input_mask_shape = ct.EnumeratedShapes(
+    #     shapes=[
+    #         [1, 1, 512, 512],
+    #         [1, 1, 1024, 1024],
+    #     ],
+    #     default=(1, 1, 512, 512),
+    # )
+
+    # 固定尺寸
+    s = 720
+    input_image_shape = ct.Shape(
+        shape=[1, 3, s, s],
+    )
+    input_mask_shape = ct.Shape(
+        shape=[1, 1, s, s],
+    )
+
+    coreml_model = ct.convert(
+        traced_model,
+        convert_to="mlprogram",
+        compute_precision=ct.precision.FLOAT32,
+        inputs=[
+            ct.ImageType(
+                name="image",
+                scale=1 / 255,
+                shape=input_image_shape,
+                color_layout=ct.colorlayout.RGB,
+            ),
+            ct.ImageType(
+                name="mask",
+                scale=1 / 255,
+                shape=input_mask_shape,
+                color_layout=ct.colorlayout.GRAYSCALE,
+            ),
+        ],
+        outputs=[ct.ImageType(name="output", color_layout=ct.colorlayout.RGB)],
+    )
+    coreml_model.save(
+        str(Path(checkpoint_path).parent / f"big-lama-{s}x{s}-fp32.mlpackage")
+    )
+
+    save_path = Path(checkpoint_path).with_suffix(".pt")
 
     print(f"Saving big-lama.pt model to {save_path}")
     traced_model.save(save_path)
